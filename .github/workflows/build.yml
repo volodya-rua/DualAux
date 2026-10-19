@@ -13,9 +13,32 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
       - run: cargo build --release
+      - name: Linux audio self-test (two virtual sinks)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y pulseaudio pulseaudio-utils
+          pulseaudio -D --exit-idle-time=-1 --system=false || true
+          sleep 2
+          pactl load-module module-null-sink sink_name=a
+          pactl load-module module-null-sink sink_name=b
+          ./target/release/dualaux --selftest
       - uses: actions/upload-artifact@v4
         with:
           name: dualaux-${{ runner.os }}
           path: |
             target/release/dualaux
             target/release/dualaux.exe
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-36"
+      - run: cd android && ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dualaux-android
+          path: android/app/build/outputs/apk/debug/app-debug.apk

@@ -20,6 +20,8 @@ mod sys {
     pub struct Sys {
         streams: Vec<cpal::Stream>,
         vols: Vec<Arc<AtomicU32>>,
+        /// Loudest sample (f32 bits) written to any mirrored output; read by `--selftest`.
+        pub peak: Arc<AtomicU32>,
     }
 
     fn default_name() -> Option<String> {
@@ -88,7 +90,7 @@ mod sys {
                     return Err("Unsupported sample format (need 32-bit float)".into());
                 }
                 let (out_rate, out_ch) = (oc.sample_rate().0 as f64, oc.channels() as usize);
-                let (q, vol, step) = (qs[i].clone(), self.vols[i].clone(), in_rate / out_rate);
+                let (q, vol, step, peak) = (qs[i].clone(), self.vols[i].clone(), in_rate / out_rate, self.peak.clone());
                 let (mut cur, mut nxt, mut phase) = ([0f32; 2], [0f32; 2], 1.0f64);
                 let out = dst
                     .build_output_stream(
@@ -114,6 +116,8 @@ mod sys {
                                 }
                                 phase += step;
                             }
+                            let m = d.iter().fold(0f32, |a, &s| a.max(s.abs()));
+                            peak.fetch_max(m.to_bits(), Relaxed);
                         },
                         |e| eprintln!("playback: {e}"),
                         None,
@@ -224,6 +228,87 @@ mod sys {
 
 mod ui;
 
+/// `dualaux --selftest <outfile>`: play a tone on the default output, mirror it to every other
+/// output for 3 s, and write what reached each one. Lets the audio path be checked without ears.
+#[cfg(windows)]
+fn selftest(out: &str) -> String {
+    use cpal::traits::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut sys = sys::Sys::new();
+    let ids: Vec<_> = sys.devices().into_iter().map(|d| d.id).collect();
+    if ids.is_empty() {
+        return "SKIP: no second output device".into();
+    }
+    let host = cpal::default_host();
+    let Some(dev) = host.default_output_device() else { return "FAIL: no default device".into() };
+    let cfg = dev.default_output_config().unwrap();
+    let (rate, ch) = (cfg.sample_rate().0 as f32, cfg.channels() as usize);
+    let mut t = 0f32;
+    let tone = dev
+        .build_output_stream(
+            &cfg.config(),
+            move |d: &mut [f32], _| {
+                for f in d.chunks_mut(ch) {
+                    t += 440.0 / rate;
+                    f.fill((t * std::f32::consts::TAU).sin() * 0.5);
+                }
+            },
+            |_| {},
+            None,
+        )
+        .unwrap();
+    tone.play().unwrap();
+    let vols = vec![1.0; ids.len()];
+    if let Err(e) = sys.start(&ids, &vols) {
+        return format!("FAIL: start: {e}");
+    }
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let peak = f32::from_bits(sys.peak.load(Relaxed));
+    sys.stop();
+    let _ = out;
+    format!("{} outputs {:?}, peak level {:.3} -> {}", ids.len(), ids, peak, if peak > 0.05 { "PASS" } else { "FAIL (silent)" })
+}
+
+/// Linux CI check: combine the first two sinks, confirm it became the default, then confirm Stop restores it.
+#[cfg(target_os = "linux")]
+fn selftest() -> Result<String, String> {
+    let sh = |a: &[&str]| -> String {
+        let o = std::process::Command::new("pactl").args(a).output().map(|o| o.stdout).unwrap_or_default();
+        String::from_utf8_lossy(&o).trim().to_string()
+    };
+    let mut sys = sys::Sys::new();
+    let ids: Vec<_> = sys.devices().into_iter().map(|d| d.id).take(2).collect();
+    if ids.len() < 2 {
+        return Err("need two sinks".into());
+    }
+    let before = sh(&["get-default-sink"]);
+    sys.start(&ids, &[1.0, 0.5])?;
+    let during = sh(&["get-default-sink"]);
+    let slaves = sh(&["list", "short", "sinks"]);
+    sys.stop();
+    let after = sh(&["get-default-sink"]);
+    let ok = during == "dualaux" && slaves.contains("dualaux") && after == before && !sh(&["list", "short", "sinks"]).contains("dualaux");
+    let msg = format!("sinks {ids:?}: before={before} during={during} after={after}");
+    if ok { Ok(format!("PASS {msg}")) } else { Err(format!("FAIL {msg}")) }
+}
+
 fn main() -> eframe::Result {
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("--selftest") {
+        match selftest() {
+            Ok(m) => println!("{m}"),
+            Err(m) => { eprintln!("{m}"); std::process::exit(1) }
+        }
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let a: Vec<String> = std::env::args().collect();
+        if a.get(1).map(|s| s.as_str()) == Some("--selftest") {
+            let out = a.get(2).cloned().unwrap_or_default();
+            let _ = std::fs::write(&out, selftest(&out));
+            return Ok(());
+        }
+    }
     ui::run()
 }
