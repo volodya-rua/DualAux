@@ -13,6 +13,21 @@ android {
         versionCode = 1
         versionName = "0.1"
     }
+    // Release signing reads a local keystore from ~/.gradle/gradle.properties; without it the release APK is unsigned.
+    val ks = findProperty("DUALAUX_KEYSTORE") as String?
+    signingConfigs {
+        if (ks != null) create("release") {
+            storeFile = file(ks)
+            storePassword = findProperty("DUALAUX_STORE_PASS") as String
+            keyAlias = "dualaux"
+            keyPassword = findProperty("DUALAUX_STORE_PASS") as String
+        }
+    }
+    buildTypes {
+        release {
+            if (ks != null) signingConfig = signingConfigs.getByName("release")
+        }
+    }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
 }

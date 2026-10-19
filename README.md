@@ -4,16 +4,16 @@ Play your audio on two to five headphones, earphones or speakers at once: wired,
 
 | Platform | How it works | Status |
 |---|---|---|
-| Windows | Mirrors the default output (WASAPI loopback) to the other devices you pick. Closing the window hides it in the tray. | Tested |
-| Linux | Creates a PulseAudio/PipeWire combined sink (`pactl`). | Type-checks, untested |
-| macOS | Creates a stacked CoreAudio multi-output device (`mac.swift`, compiled on first run; needs Xcode CLT). | Untested |
-| Android | Captures media audio (AudioPlaybackCapture) and plays it to each chosen output. Android 10+. | Builds, untested |
+| Windows | Mirrors the default output (WASAPI loopback) to the other devices you pick. Closing the window hides it in the tray. | Works. Automated audio self-test passes on real hardware |
+| Linux | Creates a PulseAudio/PipeWire combined sink (`pactl`). | CI self-test passes with virtual sinks; not yet tried with real headphones |
+| macOS | Creates a stacked CoreAudio multi-output device (`mac.swift`, compiled on first run; needs Xcode CLT). | Builds in CI; not yet run on a Mac |
+| Android | Captures media audio (AudioPlaybackCapture) and plays it to each chosen output. Android 10+. | Runs on an emulator (start/stop, capture prompt); not yet tried with real headphones |
 | iOS | Not possible: iOS allows one audio route per app. | n/a |
 
 ## Limits
 
 - **Windows:** Output 1 is whatever Windows plays on; the others are mirrored from it. Bluetooth devices lag behind wired ones, and there is no per-device delay yet.
-- **Android:** the original audio still plays on the phone's default route, so one device may sound doubled. Most phones can't hold two Bluetooth A2DP headsets at once; wired + Bluetooth works best. Apps that block capture (e.g. DRM video) can't be mirrored.
+- **Android:** when Android asks what to record or cast, choose **Entire screen** (not "A single app") so all audio is captured. DualAux never records your screen. The original audio still plays on the phone's default route, so one device may sound doubled. Most phones can't hold two Bluetooth A2DP headsets at once; wired + Bluetooth works best. Apps that block capture (e.g. DRM video) can't be mirrored.
 
 ## Build
 

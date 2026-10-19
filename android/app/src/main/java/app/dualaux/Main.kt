@@ -29,11 +29,15 @@ private const val ON = 0xFF4ADE80.toInt()
 // A2DP, wired headphones/headset, USB headset/device, BLE headset
 private val OUTPUTS = setOf(8, 3, 4, 22, 11, 26)
 
-private fun outputs(c: Context) = (c.getSystemService(Context.AUDIO_SERVICE) as AudioManager)
-    .getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { it.type in OUTPUTS }
+// Debug builds also list the built-in earpiece/speaker so the flow can be tested on an emulator.
+private fun outputs(c: Context): List<AudioDeviceInfo> {
+    val debug = c.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+    return (c.getSystemService(Context.AUDIO_SERVICE) as AudioManager)
+        .getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { it.type in OUTPUTS || (debug && it.type in 1..2) }
+}
 
 private fun name(d: AudioDeviceInfo): String {
-    val kind = when (d.type) { 8 -> "Bluetooth"; 26 -> "Bluetooth LE"; 22, 11 -> "USB"; else -> "Wired" }
+    val kind = when (d.type) { 8 -> "Bluetooth"; 26 -> "Bluetooth LE"; 22, 11 -> "USB"; 1, 2 -> "Built-in"; else -> "Wired" }
     return "${d.productName} · $kind"
 }
 
@@ -43,6 +47,8 @@ class MainActivity : Activity() {
     private val slots = ArrayList<Slot>()
     private var devs = emptyList<AudioDeviceInfo>()
     private var on = false
+    // Debug builds (emulator) can mirror with one device so the capture path can be tested.
+    private val minSlots by lazy { if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) 1 else 2 }
     private lateinit var list: LinearLayout
     private lateinit var btn: TextView
     private lateinit var status: TextView
@@ -106,7 +112,7 @@ class MainActivity : Activity() {
         devs = outputs(this)
         if (!on) {
             slots.removeAll { s -> devs.none { it.id == s.id } }
-            while (slots.size < 2) slots += Slot(unused()?.id ?: break)
+            while (slots.size < minSlots) slots += Slot(unused()?.id ?: break)
         }
         render()
     }
@@ -120,7 +126,7 @@ class MainActivity : Activity() {
                 setOnClickListener { slots += Slot(unused()!!.id); render() }
             }, LinearLayout.LayoutParams(MATCH_PARENT, dp(48)))
         }
-        if (devs.size < 2) msg.text = "Connect two headphones to begin" else if (!on) msg.text = ""
+        if (devs.size < minSlots) msg.text = "Connect two headphones to begin" else if (!on) msg.text = ""
         paint(on, animate = false)
     }
 
@@ -132,7 +138,7 @@ class MainActivity : Activity() {
         }
         val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         head.addView(text("OUTPUT ${i + 1}", 10.5f, DIM), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        if (!on && slots.size > 2) head.addView(text("×", 20f, DIM).apply {
+        if (!on && slots.size > minSlots) head.addView(text("×", 20f, DIM).apply {
             setPadding(dp(8), 0, 0, 0); setOnClickListener { slots.remove(s); render() }
         })
         c.addView(head)
@@ -183,7 +189,8 @@ class MainActivity : Activity() {
 
     private fun toggle() {
         if (on) { stopService(Intent(this, Mirror::class.java)); on = false; msg.text = ""; render(); return }
-        if (devs.size < 2 || slots.size < 2) return
+        if (devs.size < minSlots || slots.size < minSlots) return
+        msg.text = "Choose \"Entire screen\" in the next prompt to capture all audio"
         startActivityForResult((getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager).createScreenCaptureIntent(), 7)
     }
 
@@ -191,6 +198,7 @@ class MainActivity : Activity() {
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
         if (req != 7 || res != RESULT_OK || data == null) return
         for ((i, s) in slots.withIndex()) Mirror.vols[i] = s.vol
+        Mirror.running = true  // onResume runs right after this and must not reset the UI to Idle
         startForegroundService(Intent(this, Mirror::class.java)
             .putExtra("code", res).putExtra("data", data).putExtra("ids", slots.map { it.id }.toIntArray()))
         on = true; msg.text = "Playing on ${slots.size} outputs"; render()
@@ -216,7 +224,7 @@ class Mirror : Service() {
         startForeground(1, Notification.Builder(this, "m").setContentTitle("DualAux")
             .setContentText("Mirroring to your outputs").setSmallIcon(android.R.drawable.ic_media_play).build(),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        try { start(i) } catch (e: Exception) { stopSelf() }
+        try { start(i) } catch (e: Exception) { running = false; stopSelf() }
         return START_NOT_STICKY
     }
 
