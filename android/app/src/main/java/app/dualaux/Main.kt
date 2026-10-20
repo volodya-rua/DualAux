@@ -3,8 +3,14 @@ package app.dualaux
 import android.Manifest
 import android.animation.ValueAnimator
 import android.app.*
+import android.bluetooth.BluetoothA2dp
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.provider.Settings
 import android.content.pm.ServiceInfo
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -25,6 +31,7 @@ private const val CARD = 0xFF0D0D0D.toInt()
 private const val LINE = 0xFF1C1C1C.toInt()
 private const val DIM = 0xFF787878.toInt()
 private const val ON = 0xFF4ADE80.toInt()
+private const val WARN = 0xFFE0A030.toInt()
 
 // A2DP, wired headphones/headset, USB headset/device, hearing aid, BLE headset/speaker
 private val OUTPUTS = setOf(8, 3, 4, 22, 11, 23, 26, 27)
@@ -65,6 +72,15 @@ class MainActivity : Activity() {
         override fun onAudioDevicesRemoved(a: Array<AudioDeviceInfo>) = sync()
     }
 
+    // Android connects several Bluetooth headphones but hands apps audio for only the one "active" headset.
+    // We read the connected list so the others can be shown and explained instead of silently missing.
+    private var a2dp: BluetoothProfile? = null
+    private var idle = emptyList<String>()
+    private val bt by lazy { getSystemService(BluetoothManager::class.java)?.adapter }
+    private val btChanged = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) = sync()
+    }
+
     private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
     private fun round(fill: Int, r: Int, line: Int = LINE) = GradientDrawable().apply {
         setColor(fill); cornerRadius = dp(r).toFloat(); setStroke(dp(1), line)
@@ -76,7 +92,13 @@ class MainActivity : Activity() {
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         window.statusBarColor = BG; window.navigationBarColor = BG
-        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS), 1)
+        val perms = arrayListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
+        if (Build.VERSION.SDK_INT >= 31) perms += Manifest.permission.BLUETOOTH_CONNECT
+        requestPermissions(perms.toTypedArray(), 1)
+        bt?.getProfileProxy(this, object : BluetoothProfile.ServiceListener {
+            override fun onServiceConnected(p: Int, proxy: BluetoothProfile) { a2dp = proxy; sync() }
+            override fun onServiceDisconnected(p: Int) { a2dp = null }
+        }, BluetoothProfile.A2DP)
 
         dot = View(this)
         status = text("Idle", 12f, DIM)
@@ -106,16 +128,26 @@ class MainActivity : Activity() {
         super.onResume()
         on = Mirror.running
         am.registerAudioDeviceCallback(cb, null)
+        val f = IntentFilter(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(btChanged, f, RECEIVER_NOT_EXPORTED) else registerReceiver(btChanged, f)
         sync()
     }
 
-    override fun onPause() { am.unregisterAudioDeviceCallback(cb); super.onPause() }
+    override fun onPause() { am.unregisterAudioDeviceCallback(cb); unregisterReceiver(btChanged); super.onPause() }
+
+    override fun onDestroy() { a2dp?.let { bt?.closeProfileProxy(BluetoothProfile.A2DP, it) }; super.onDestroy() }
+
+    override fun onRequestPermissionsResult(req: Int, perms: Array<String>, res: IntArray) = sync()
 
     private fun unused() = devs.firstOrNull { d -> slots.none { it.id == d.id } }
 
     private fun sync() {
         devs = outputs(this)
-        if (!on) {
+        // Compare by the last two address bytes: Android may mask the rest of a Bluetooth address.
+        val usable = devs.map { it.address.takeLast(5).uppercase() }.toSet()
+        idle = try {
+            a2dp?.connectedDevices.orEmpty().filter { it.address.takeLast(5).uppercase() !in usable }.map { it.name ?: it.address }
+        } catch (e: SecurityException) { emptyList() } // Bluetooth permission not granted        if (!on) {
             slots.removeAll { s -> devs.none { it.id == s.id } }
             while (slots.size < minSlots) slots += Slot(unused()?.id ?: break)
         }
@@ -149,11 +181,28 @@ class MainActivity : Activity() {
             list.addView(text("+   Add device", 13f, DIM).apply {
                 gravity = Gravity.CENTER; background = round(BG, 20)
                 setOnClickListener { slots += Slot(unused()!!.id); render() }
-            }, LinearLayout.LayoutParams(MATCH_PARENT, dp(48)))
+            }, LinearLayout.LayoutParams(MATCH_PARENT, dp(48)).apply { bottomMargin = dp(12) })
         }
-        if (devs.size < minSlots) msg.text = "Connect two headphones to begin" else if (!on) msg.text = ""
+        if (idle.isNotEmpty()) list.addView(idleNote(), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(12) })
+        if (!on) list.addView(text("Connect headphones in Bluetooth settings  ›", 13f, DIM).apply {
+            gravity = Gravity.CENTER; setPadding(0, dp(10), 0, dp(10))
+            setOnClickListener { startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        if (devs.size < minSlots) msg.text = if (idle.isNotEmpty()) "Add wired or USB headphones as the second output" else "Connect two headphones to begin"
+        else if (!on) msg.text = ""
         paint(on, animate = false)
         handler.removeCallbacks(poll); if (on) handler.post(poll)
+    }
+
+    private fun idleNote() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL; setPadding(dp(18), dp(16), dp(18), dp(16))
+        background = round(CARD, 20, 0xFF3A2E14.toInt())
+        addView(text("CONNECTED, BUT ANDROID WON'T SHARE IT", 10.5f, WARN))
+        addView(text(idle.joinToString("\n"), 14f, Color.WHITE), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8) })
+        addView(text("Android plays to only one Bluetooth headset at a time and keeps the others connected but silent, " +
+            "for every app. On this phone, add wired or USB headphones for more outputs. " +
+            "For up to 5 Bluetooth headphones, use DualAux on a Windows PC.", 12f, DIM),
+            LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8) })
     }
 
     private fun card(i: Int, s: Slot): View {

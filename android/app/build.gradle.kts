@@ -10,7 +10,7 @@ android {
         applicationId = "app.dualaux"
         minSdk = 29  // AudioPlaybackCapture
         targetSdk = 34
-        versionCode = 3
+        versionCode = 4
         versionName = "0.2.0"
     }
     // Release signing reads a local keystore from ~/.gradle/gradle.properties; without it the release APK is unsigned.

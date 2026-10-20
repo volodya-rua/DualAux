@@ -23,6 +23,7 @@ _Last updated: 2026-10-19_
 - **Record audio (`RECORD_AUDIO`)**: required by Android to capture the audio your phone is playing (AudioPlaybackCapture). The microphone is **not** used.
 - **Screen capture prompt (MediaProjection)**: Android shows this prompt for audio capture. DualAux requests **audio only** and never captures your screen.
 - **Foreground service and notifications**: to keep playing with the screen off and to show the "mirroring" notification.
+- **Nearby devices (`BLUETOOTH_CONNECT`)**: only to read the names of Bluetooth headphones that are already connected, so DualAux can show the ones Android won't let apps play to. Android's prompt mentions finding devices and their position because that is its standard wording for this permission; DualAux never scans, pairs, connects or uses location. You can deny it and the app still works, without that list.
 
 ### Desktop
 
