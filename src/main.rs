@@ -11,17 +11,23 @@ mod sys {
     use super::Dev;
     use cpal::traits::*;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     type Q = Arc<Mutex<VecDeque<[f32; 2]>>>;
+
+    /// Longest per-output sync delay the UI offers.
+    pub const MAX_DELAY_MS: u32 = 500;
 
     #[derive(Default)]
     pub struct Sys {
         streams: Vec<cpal::Stream>,
         vols: Vec<Arc<AtomicU32>>,
-        /// Loudest sample (f32 bits) written to any mirrored output; read by `--selftest`.
-        pub peak: Arc<AtomicU32>,
+        delays: Vec<Arc<AtomicU32>>,
+        /// Per output, for `--selftest`: loudest sample written (f32 bits) and ms until sound first arrived.
+        pub peaks: Vec<Arc<AtomicU32>>,
+        pub first: Vec<Arc<AtomicU64>>,
     }
 
     fn default_name() -> Option<String> {
@@ -46,7 +52,8 @@ mod sys {
                 })
                 .unwrap_or_default()
         }
-        pub fn start(&mut self, ids: &[String], vols: &[f32]) -> Result<(), String> {
+        /// `delays` hold an output back by that many ms, to line up Bluetooth devices of different latency.
+        pub fn start(&mut self, ids: &[String], vols: &[f32], delays: &[u32]) -> Result<(), String> {
             self.stop();
             let e = |e: &dyn std::fmt::Display| e.to_string();
             let host = cpal::default_host();
@@ -58,10 +65,15 @@ mod sys {
             }
             let (in_rate, in_ch) = (ic.sample_rate().0 as f64, ic.channels() as usize);
             self.vols = vols.iter().map(|v| Arc::new(AtomicU32::new(v.to_bits()))).collect();
+            self.delays = delays.iter().map(|d| Arc::new(AtomicU32::new(*d))).collect();
+            self.peaks = ids.iter().map(|_| Arc::new(AtomicU32::new(0))).collect();
+            self.first = ids.iter().map(|_| Arc::new(AtomicU64::new(0))).collect();
+            let t0 = Instant::now();
 
             // ponytail: Mutex in the audio callbacks; swap for a lock-free ring buffer if it glitches
             let qs: Vec<Q> = ids.iter().map(|_| Default::default()).collect();
-            let (qi, cap) = (qs.clone(), (in_rate * 0.25) as usize); // cap latency at 250 ms
+            // room for the longest delay plus 250 ms of jitter; beyond that the oldest audio is dropped
+            let (qi, cap) = (qs.clone(), (in_rate * (0.25 + MAX_DELAY_MS as f64 / 1000.0)) as usize);
             // building an *input* stream on an output device = WASAPI loopback
             let input = src
                 .build_input_stream(
@@ -90,14 +102,35 @@ mod sys {
                     return Err("Unsupported sample format (need 32-bit float)".into());
                 }
                 let (out_rate, out_ch) = (oc.sample_rate().0 as f64, oc.channels() as usize);
-                let (q, vol, step, peak) = (qs[i].clone(), self.vols[i].clone(), in_rate / out_rate, self.peak.clone());
+                let (q, vol, step) = (qs[i].clone(), self.vols[i].clone(), in_rate / out_rate);
+                let (delay, peak, first) = (self.delays[i].clone(), self.peaks[i].clone(), self.first[i].clone());
                 let (mut cur, mut nxt, mut phase) = ([0f32; 2], [0f32; 2], 1.0f64);
+                let (mut primed, mut held) = (false, 0usize);
+                let slack = (in_rate * 0.03) as usize; // jitter allowed before the hold-back is corrected
                 let out = dst
                     .build_output_stream(
                         &oc.config(),
                         move |d: &mut [f32], _| {
                             let mut q = q.lock().unwrap();
                             let v = f32::from_bits(vol.load(Relaxed));
+                            // Delay = how many captured frames to keep queued before playing. A longer delay refills
+                            // the buffer (a short gap); a shorter one drops the extra frames.
+                            let want = (delay.load(Relaxed) as f64 * in_rate / 1000.0) as usize;
+                            if want > held + slack {
+                                primed = false;
+                            }
+                            held = want;
+                            if q.len() > want + slack {
+                                let extra = q.len() - want - slack;
+                                q.drain(..extra);
+                            }
+                            if !primed && q.len() >= want {
+                                primed = true;
+                            }
+                            if !primed {
+                                d.fill(0.0);
+                                return;
+                            }
                             for frame in d.chunks_mut(out_ch) {
                                 while phase >= 1.0 {
                                     match q.pop_front() {
@@ -116,8 +149,14 @@ mod sys {
                                 }
                                 phase += step;
                             }
+                            if q.is_empty() && want > 0 {
+                                primed = false; // ran dry: rebuild the hold-back
+                            }
                             let m = d.iter().fold(0f32, |a, &s| a.max(s.abs()));
                             peak.fetch_max(m.to_bits(), Relaxed);
+                            if m > 0.01 && first.load(Relaxed) == 0 {
+                                first.store((t0.elapsed().as_millis() as u64).max(1), Relaxed);
+                            }
                         },
                         |e| eprintln!("playback: {e}"),
                         None,
@@ -137,6 +176,11 @@ mod sys {
         pub fn vol(&self, i: usize, _id: &str, v: f32) {
             if let Some(a) = self.vols.get(i) {
                 a.store(v.to_bits(), Relaxed);
+            }
+        }
+        pub fn delay(&self, i: usize, ms: u32) {
+            if let Some(a) = self.delays.get(i) {
+                a.store(ms.min(MAX_DELAY_MS), Relaxed);
             }
         }
     }
@@ -189,7 +233,7 @@ mod sys {
                 .map(|s| Dev { id: s[id].as_str().unwrap_or("").into(), label: s[label].as_str().unwrap_or("").into() })
                 .collect()
         }
-        pub fn start(&mut self, ids: &[String], vols: &[f32]) -> Result<(), String> {
+        pub fn start(&mut self, ids: &[String], vols: &[f32], _delays: &[u32]) -> Result<(), String> {
             #[cfg(target_os = "linux")]
             {
                 self.prev = Some(sh("pactl", &["get-default-sink"])?);
@@ -216,6 +260,7 @@ mod sys {
             #[cfg(target_os = "macos")]
             let _ = mac(&["stop"]);
         }
+        pub fn delay(&self, _i: usize, _ms: u32) {} // sync delay is Windows-only for now
         pub fn vol(&self, _i: usize, id: &str, v: f32) {
             #[cfg(target_os = "linux")]
             let _ = sh("pactl", &["set-sink-volume", id, &format!("{}%", (v * 100.0).round())]);
@@ -258,15 +303,27 @@ fn selftest(out: &str) -> String {
         )
         .unwrap();
     tone.play().unwrap();
-    let vols = vec![1.0; ids.len()];
-    if let Err(e) = sys.start(&ids, &vols) {
+    // Five outputs in total (the default plus four mirrors). With fewer real devices the same one is reused,
+    // which still exercises four parallel streams. The last mirror is held back 200 ms to check the delay.
+    let ids: Vec<String> = (0..4).map(|i| ids[i % ids.len()].clone()).collect();
+    let vols = vec![1.0; 4];
+    let delays = [0, 0, 0, 200];
+    if let Err(e) = sys.start(&ids, &vols, &delays) {
         return format!("FAIL: start: {e}");
     }
     std::thread::sleep(std::time::Duration::from_secs(3));
-    let peak = f32::from_bits(sys.peak.load(Relaxed));
+    let peaks: Vec<f32> = sys.peaks.iter().map(|p| f32::from_bits(p.load(Relaxed))).collect();
+    let first: Vec<u64> = sys.first.iter().map(|f| f.load(Relaxed)).collect();
     sys.stop();
     let _ = out;
-    format!("{} outputs {:?}, peak level {:.3} -> {}", ids.len(), ids, peak, if peak > 0.05 { "PASS" } else { "FAIL (silent)" })
+    let loud = peaks.iter().all(|&p| p > 0.05);
+    let gap = first[3] as i64 - first[0] as i64;
+    let delayed = (150..=400).contains(&gap);
+    format!(
+        "4 mirrored outputs {:?}\npeaks {:?}\nfirst sound ms {:?}, delayed output arrives {} ms later\n-> {}",
+        ids, peaks, first, gap,
+        if loud && delayed { "PASS" } else if !loud { "FAIL (silent output)" } else { "FAIL (delay off)" }
+    )
 }
 
 /// Linux CI check: combine the first two sinks, confirm it became the default, then confirm Stop restores it.
@@ -282,7 +339,7 @@ fn selftest() -> Result<String, String> {
         return Err("need two sinks".into());
     }
     let before = sh(&["get-default-sink"]);
-    sys.start(&ids, &[1.0, 0.5])?;
+    sys.start(&ids, &[1.0, 0.5], &[0, 0])?;
     let during = sh(&["get-default-sink"]);
     let slaves = sh(&["list", "short", "sinks"]);
     sys.stop();

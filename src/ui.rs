@@ -3,6 +3,7 @@ use eframe::egui::{self, vec2, Color32, Id, RichText, Rounding, Sense, Stroke};
 use std::time::{Duration, Instant};
 
 const MAX_OUTPUTS: usize = 5;
+const DELAY_MAX: u32 = 500; // keep equal to sys::MAX_DELAY_MS on Windows
 const BG: Color32 = Color32::from_rgb(5, 5, 5);
 const CARD: Color32 = Color32::from_rgb(13, 13, 13);
 const LINE: Color32 = Color32::from_rgb(28, 28, 28);
@@ -12,6 +13,7 @@ const ON: Color32 = Color32::from_rgb(74, 222, 128);
 struct Out {
     id: String,
     vol: f32,
+    delay: u32, // ms
 }
 
 struct App {
@@ -179,7 +181,7 @@ impl App {
         self.outs.retain(|o| ids.contains(&o.id));
         while self.outs.len() < self.min_outs() {
             match self.unused() {
-                Some(id) => self.outs.push(Out { id, vol: 1.0 }),
+                Some(id) => self.outs.push(Out { id, vol: 1.0, delay: 0 }),
                 None => break,
             }
         }
@@ -209,6 +211,7 @@ impl App {
         let can_remove = !self.on && self.outs.len() > self.min_outs();
         let taken: Vec<String> = self.outs.iter().map(|o| o.id.clone()).collect();
         let mut vol_changed = false;
+        let mut delay_changed = false;
         Self::frame(ui.ctx(), self.on).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -240,9 +243,27 @@ impl App {
                 vol_changed = slider(ui, &mut self.outs[i].vol, w);
                 ui.label(RichText::new(format!("{}%", (self.outs[i].vol * 100.0).round() as i32)).size(12.0).color(DIM));
             });
+            // Sync delay holds this output back so Bluetooth devices of different latency line up.
+            // Windows only; the other platforms have no per-output control.
+            if cfg!(windows) {
+                ui.add_space(4.0);
+                ui.label(Self::small("Sync delay"));
+                ui.horizontal(|ui| {
+                    let w = ui.available_width() - 52.0;
+                    let mut v = self.outs[i].delay as f32 / DELAY_MAX as f32;
+                    if slider(ui, &mut v, w) {
+                        self.outs[i].delay = ((v * DELAY_MAX as f32 / 10.0).round() as u32) * 10; // 10 ms steps
+                        delay_changed = true;
+                    }
+                    ui.label(RichText::new(format!("{} ms", self.outs[i].delay)).size(12.0).color(DIM));
+                });
+            }
         });
         if vol_changed && self.on {
             self.sys.vol(i, &self.outs[i].id, self.outs[i].vol);
+        }
+        if delay_changed && self.on {
+            self.sys.delay(i, self.outs[i].delay);
         }
         remove
     }
@@ -297,7 +318,8 @@ impl eframe::App for App {
                     } else {
                         let ids: Vec<_> = self.outs.iter().map(|o| o.id.clone()).collect();
                         let vols: Vec<_> = self.outs.iter().map(|o| o.vol).collect();
-                        match self.sys.start(&ids, &vols) {
+                        let delays: Vec<_> = self.outs.iter().map(|o| o.delay).collect();
+                        match self.sys.start(&ids, &vols, &delays) {
                             Ok(()) => {
                                 self.on = true;
                                 self.msg = format!("Playing on {} outputs", ids.len() + self.fixed_a.is_some() as usize)
@@ -340,7 +362,7 @@ impl eframe::App for App {
                             let add = egui::Button::new(RichText::new("+   Add device").size(13.0).color(DIM))
                                 .rounding(Rounding::same(20.0));
                             if ui.add_sized([ui.available_width(), 44.0], add).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                self.outs.push(Out { id, vol: 1.0 });
+                                self.outs.push(Out { id, vol: 1.0, delay: 0 });
                             }
                             ui.add_space(12.0);
                         }
