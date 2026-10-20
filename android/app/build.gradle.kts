@@ -10,8 +10,8 @@ android {
         applicationId = "app.dualaux"
         minSdk = 29  // AudioPlaybackCapture
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.1.1"
     }
     // Release signing reads a local keystore from ~/.gradle/gradle.properties; without it the release APK is unsigned.
     val ks = findProperty("DUALAUX_KEYSTORE") as String?

@@ -19,25 +19,25 @@ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.*
 
-private const val MAX = 5
+const val MAX = 5
 private const val BG = 0xFF050505.toInt()
 private const val CARD = 0xFF0D0D0D.toInt()
 private const val LINE = 0xFF1C1C1C.toInt()
 private const val DIM = 0xFF787878.toInt()
 private const val ON = 0xFF4ADE80.toInt()
 
-// A2DP, wired headphones/headset, USB headset/device, BLE headset
-private val OUTPUTS = setOf(8, 3, 4, 22, 11, 26)
+// A2DP, wired headphones/headset, USB headset/device, hearing aid, BLE headset/speaker
+private val OUTPUTS = setOf(8, 3, 4, 22, 11, 23, 26, 27)
 
 // Debug builds also list the built-in earpiece/speaker so the flow can be tested on an emulator.
-private fun outputs(c: Context): List<AudioDeviceInfo> {
+fun outputs(c: Context): List<AudioDeviceInfo> {
     val debug = c.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
     return (c.getSystemService(Context.AUDIO_SERVICE) as AudioManager)
         .getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { it.type in OUTPUTS || (debug && it.type in 1..2) }
 }
 
 private fun name(d: AudioDeviceInfo): String {
-    val kind = when (d.type) { 8 -> "Bluetooth"; 26 -> "Bluetooth LE"; 22, 11 -> "USB"; 1, 2 -> "Built-in"; else -> "Wired" }
+    val kind = when (d.type) { 8 -> "Bluetooth"; 26, 27 -> "Bluetooth LE"; 23 -> "Hearing aid"; 22, 11 -> "USB"; 1, 2 -> "Built-in"; else -> "Wired" }
     return "${d.productName} · $kind"
 }
 
@@ -54,6 +54,11 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var dot: View
     private lateinit var msg: TextView
+    private val states = ArrayList<TextView>()  // one per card: whether Android really routed audio to that device
+    private val handler = Handler(Looper.getMainLooper())
+    private val poll = object : Runnable {
+        override fun run() { showStates(); if (on) handler.postDelayed(this, 500) }
+    }
     private val am by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
     private val cb = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(a: Array<AudioDeviceInfo>) = sync()
@@ -117,8 +122,28 @@ class MainActivity : Activity() {
         render()
     }
 
+    private fun showStates() {
+        val n = slots.size
+        val ok = (0 until n).count { Mirror.state[it] == 1 }
+        for ((i, t) in states.withIndex()) {
+            val (txt, col) = when (if (on) Mirror.state[i] else -1) {
+                0 -> "Starting…" to DIM
+                1 -> "Playing" to ON
+                2 -> "Android didn't route audio here. Reconnect this device, or see Limits in the README" to 0xFFE0A030.toInt()
+                3 -> "Disconnected or failed" to 0xFFE05050.toInt()
+                else -> "" to DIM
+            }
+            t.text = txt; t.setTextColor(col); t.visibility = if (txt.isEmpty()) View.GONE else View.VISIBLE
+        }
+        if (on) msg.text = when {
+            ok == n -> "Playing on $n outputs"
+            (0 until n).any { Mirror.state[it] == 0 } -> "Starting…"
+            else -> "Playing on $ok of $n outputs"
+        }
+    }
+
     private fun render() {
-        list.removeAllViews()
+        list.removeAllViews(); states.clear()
         for ((i, s) in slots.withIndex()) list.addView(card(i, s), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(12) })
         if (!on && slots.size < MAX && unused() != null) {
             list.addView(text("+   Add device", 13f, DIM).apply {
@@ -128,6 +153,7 @@ class MainActivity : Activity() {
         }
         if (devs.size < minSlots) msg.text = "Connect two headphones to begin" else if (!on) msg.text = ""
         paint(on, animate = false)
+        handler.removeCallbacks(poll); if (on) handler.post(poll)
     }
 
     private fun card(i: Int, s: Slot): View {
@@ -170,6 +196,9 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             addView(seek, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)); addView(pct)
         }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(6) })
+        val st = text("", 12f, DIM).apply { visibility = View.GONE }
+        states += st
+        c.addView(st, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8) })
         return c
     }
 
@@ -199,69 +228,12 @@ class MainActivity : Activity() {
         if (req != 7 || res != RESULT_OK || data == null) return
         for ((i, s) in slots.withIndex()) Mirror.vols[i] = s.vol
         Mirror.running = true  // onResume runs right after this and must not reset the UI to Idle
+        Mirror.state.fill(0)
         startForegroundService(Intent(this, Mirror::class.java)
             .putExtra("code", res).putExtra("data", data).putExtra("ids", slots.map { it.id }.toIntArray()))
-        on = true; msg.text = "Playing on ${slots.size} outputs"; render()
+        on = true; msg.text = "Starting…"; render()
         // the service may fail to start (e.g. no mic permission); resync with what it reports
         Handler(Looper.getMainLooper()).postDelayed({ if (on && !Mirror.running) { on = false; msg.text = "Couldn't start. Check permissions."; render() } }, 1200)
     }
 }
 
-class Mirror : Service() {
-    companion object {
-        val vols = FloatArray(MAX) { 1f }
-        @Volatile var running = false
-    }
-
-    @Volatile private var run = false
-
-    override fun onBind(i: Intent?): IBinder? = null
-
-    @Suppress("DEPRECATION")
-    override fun onStartCommand(i: Intent, f: Int, id: Int): Int {
-        getSystemService(NotificationManager::class.java)
-            .createNotificationChannel(NotificationChannel("m", "Mirroring", NotificationManager.IMPORTANCE_LOW))
-        startForeground(1, Notification.Builder(this, "m").setContentTitle("DualAux")
-            .setContentText("Mirroring to your outputs").setSmallIcon(android.R.drawable.ic_media_play).build(),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        try { start(i) } catch (e: Exception) { running = false; stopSelf() }
-        return START_NOT_STICKY
-    }
-
-    @Suppress("DEPRECATION")
-    private fun start(i: Intent) {
-        val proj = (getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager)
-            .getMediaProjection(i.getIntExtra("code", 0), i.getParcelableExtra("data")!!)!!
-        val all = outputs(this)
-        val rate = 48000
-        val cfg = AudioPlaybackCaptureConfiguration.Builder(proj)
-            .addMatchingUsage(AudioAttributes.USAGE_MEDIA).addMatchingUsage(AudioAttributes.USAGE_GAME)
-            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).excludeUid(Process.myUid()).build()
-        val rec = AudioRecord.Builder().setAudioPlaybackCaptureConfig(cfg).setAudioFormat(
-            AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(rate)
-                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build()).build()
-        val out = AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(rate)
-            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build()
-        val buf = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT) * 2
-        val tracks = i.getIntArrayExtra("ids")!!.map { dev ->
-            AudioTrack.Builder().setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).build())
-                .setAudioFormat(out).setBufferSizeInBytes(buf).build().apply {
-                    preferredDevice = all.first { it.id == dev }; play()
-                }
-        }
-        run = true; running = true
-        // ponytail: one thread writes every track in turn, so a stalled device delays the others; split per track if it glitches
-        // ponytail: the original audio still plays on the phone's default route; Android can't mute other apps
-        Thread {
-            val b = ShortArray(buf / 2)
-            rec.startRecording()
-            while (run) {
-                val n = rec.read(b, 0, b.size)
-                if (n > 0) tracks.forEachIndexed { k, t -> t.setVolume(vols[k]); t.write(b, 0, n) }
-            }
-            rec.release(); tracks.forEach { it.release() }; proj.stop(); running = false
-        }.start()
-    }
-
-    override fun onDestroy() { run = false }
-}

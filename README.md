@@ -13,7 +13,7 @@ Play your audio on two to five headphones, earphones or speakers at once: wired,
 ## Limits
 
 - **Windows:** Output 1 is whatever Windows plays on; the others are mirrored from it. Bluetooth devices lag behind wired ones, and there is no per-device delay yet.
-- **Android:** when Android asks what to record or cast, choose **Entire screen** (not "A single app") so all audio is captured. DualAux never records your screen. The original audio still plays on the phone's default route, so one device may sound doubled. Most phones can't hold two Bluetooth A2DP headsets at once; wired + Bluetooth works best. Apps that block capture (e.g. DRM video) can't be mirrored.
+- **Android:** when Android asks what to record or cast, choose **Entire screen** (not "A single app") so all audio is captured. DualAux never records your screen. The original audio still plays on the phone's default route, so one device may sound doubled. **How many outputs really play at once is decided by your phone's Bluetooth stack, not by DualAux:** stock Android sends audio to only one Bluetooth headset at a time, so several Bluetooth headsets only work on phones with a dual-audio / multi-connection feature, or with LE Audio devices on newer Android. Wired, USB and one Bluetooth device normally work together. Each card shows whether Android really routed audio to that device ("Playing", or a warning). Apps that block capture (e.g. DRM video) can't be mirrored.
 
 ## Build
 
