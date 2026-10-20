@@ -147,7 +147,8 @@ class MainActivity : Activity() {
         val usable = devs.map { it.address.takeLast(5).uppercase() }.toSet()
         idle = try {
             a2dp?.connectedDevices.orEmpty().filter { it.address.takeLast(5).uppercase() !in usable }.map { it.name ?: it.address }
-        } catch (e: SecurityException) { emptyList() } // Bluetooth permission not granted        if (!on) {
+        } catch (e: SecurityException) { emptyList() } // Bluetooth permission not granted
+        if (!on) {
             slots.removeAll { s -> devs.none { it.id == s.id } }
             while (slots.size < minSlots) slots += Slot(unused()?.id ?: break)
         }
